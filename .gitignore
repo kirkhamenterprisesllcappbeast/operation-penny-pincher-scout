@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env*
+.local/
+scout-report.json
+scout-report.md
+unit-tests.txt

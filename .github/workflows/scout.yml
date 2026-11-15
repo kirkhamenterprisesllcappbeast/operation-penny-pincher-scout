@@ -1,0 +1,29 @@
+name: Public Scout
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: public-scout
+  cancel-in-progress: false
+jobs:
+  discover:
+    if: github.repository == 'kirkhamenterprisesllcappbeast/operation-penny-pincher-scout' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run offline safety and parsing tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Read public opportunity sources
+        run: python3 prototype/marketplace_scout.py --output scout-report.json --markdown scout-report.md
+      - name: Publish bounded public report to summary and log
+        run: |
+          cat scout-report.md >> "$GITHUB_STEP_SUMMARY"
+          cat scout-report.md
