@@ -1,4 +1,5 @@
-# Penny Pincher Public Scout
+# operation-penny-pincher-scout
+
 
 Subscription-free, read-only discovery of advertised digital work. Runs hourly on
 standard GitHub-hosted Linux runners in this public repository, or manually on an
