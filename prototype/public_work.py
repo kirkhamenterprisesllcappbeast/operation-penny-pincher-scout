@@ -10,7 +10,7 @@ import re
 from ipaddress import ip_address
 from decimal import Decimal
 from urllib.parse import urlencode, urlsplit
-from scout_common import FetchError, now
+from scout_common import FetchError, now, error_record, coverage_status
 from task_costs import assess_costs, net_return_gate
 
 SEARCH = 'https://api.github.com/search/issues'
@@ -120,21 +120,33 @@ def discover_public_work(transport):
         status='PARTIAL_SEARCH_SAMPLE' if partial else 'FETCHED'
         if errors: status='PARTIAL_MALFORMED'
     except FetchError as e:
-        status=e.code; errors.append({'code':e.code,'retry_after':e.retry_after})
-    except (ValueError,TypeError,AttributeError): status='MALFORMED_RESPONSE'
-    except (OSError,http.client.HTTPException): status='NETWORK_ERROR'
+        status=e.code; errors.append(error_record(e, 'github_public_work', 'search_issues'))
+    except (ValueError,TypeError,AttributeError):
+        status='MALFORMED_RESPONSE'; errors.append({'code':status,'source':'github_public_work','operation':'search_issues'})
+    except (OSError,http.client.HTTPException):
+        status='NETWORK_ERROR'; errors.append({'code':status,'source':'github_public_work','operation':'search_issues'})
     results=[{'provider':'github_public_work','status':status,'tasks':tasks,'errors':errors,
               'queries':queries,'total_matches_per_query':totals,'checked_at':now(),
+              'coverage_status':coverage_status(status),
+              'coverage_interrupted':len(totals)<len(QUERIES) or status=='PARTIAL_MALFORMED',
+              'operations_planned':len(QUERIES),'operations_attempted':len(queries),
+              'operations_completed':len(totals),
               'coverage_note':'Bounded sample, not exhaustive; Overlapping searches are not independent corroboration.'}]
-    # The published open-source route was inspected; its live API currently 404s.
-    # Record the actual failure without scraping a replacement or inventing work.
+    # Probe only the configured route; record the observed outcome without
+    # scraping a replacement, assuming a current error code or inventing work.
+    algora_errors=[]
     try:
         response=transport.get(ALGORA)
         algora_status='UNSUPPORTED_API_CONTRACT_REVIEW_REQUIRED'
-    except FetchError as e: algora_status=e.code
-    except (ValueError,TypeError): algora_status='MALFORMED_RESPONSE'
-    except (OSError,http.client.HTTPException): algora_status='NETWORK_ERROR'
+    except FetchError as e:
+        algora_status=e.code; algora_errors.append(error_record(e, 'algora', 'list_bounties'))
+    except (ValueError,TypeError):
+        algora_status='MALFORMED_RESPONSE'; algora_errors.append({'code':algora_status,'source':'algora','operation':'list_bounties'})
+    except (OSError,http.client.HTTPException):
+        algora_status='NETWORK_ERROR'; algora_errors.append({'code':algora_status,'source':'algora','operation':'list_bounties'})
     results.append({'provider':'algora','status':algora_status,'tasks':[],
+                    'errors':algora_errors,'coverage_status':'PARTIAL','coverage_interrupted':True,
+                    'operations_attempted':1,'operations_completed':0,
                     'source_url':ALGORA,'checked_at':now(),
                     'note':'No functioning current public listing contract verified. This is not proof of zero available bounties.'})
     return results
@@ -151,12 +163,72 @@ def rank_leads(tasks):
             for index,t in enumerate(leads)]
 
 
+def next_action(report):
+    limited=[p for p in report['providers'] if p['status']=='RATE_LIMITED']
+    if limited:
+        actions=[]
+        for provider in limited:
+            times=[e.get('earliest_retry_at') for e in provider.get('errors',[]) if isinstance(e,dict)]
+            times=[t for t in times if t]
+            actions.append(provider['provider']+(': do not retry before '+max(times)+
+                           ' (header-based lower bound; access is not guaranteed)' if times else
+                           ': cooldown unknown; investigate rate-limit evidence before retrying'))
+        return '; '.join(actions)+'. No automatic retries.'
+    if report.get('ranked_preliminary'):
+        return 'Review the original terms and AI policy of one preliminary lead before preparing work.'
+    blocked=[p for p in report['providers'] if p['status']!='FETCHED']
+    if blocked:
+        return ('No reviewable leads. Investigate the source conditions listed below; current coverage is incomplete. '
+                'Do not add authentication or bypass access restrictions without authorization.')
+    return 'No reviewable leads or qualifying opportunities in this completed run; wait for the next scheduled scan.'
+
+
 def markdown_report(report):
     lines=['# Scout discovery report', '', report['generated_at'], '',
            report['status']+'. Verified receipts: $'+report['verified_received_usd']+'.', '',
+           'Software execution: report generated. Final workflow result: not observed by Scout.',
+           'Discovery coverage: '+('COMPLETE' if all(p['status']=='FETCHED' for p in report['providers']) else 'PARTIAL')+'.',
+           'Advertised tasks/signals: '+str(sum(len(p['tasks']) for p in report['providers']))+
+           '. Reviewable leads: '+str(len(report.get('ranked_preliminary',[])))+
+           '. Qualified opportunities: '+str(len(report.get('ranked_viable',[])))+'.', '',
            '| Source | Result | Advertised tasks/signals retrieved |', '|---|---|---:|']
     for provider in report['providers']:
         lines.append('| '+provider['provider']+' | '+provider['status']+' | '+str(len(provider['tasks']))+' |')
+    lines.extend(['', 'Source conditions and coverage:'])
+    for provider in report['providers']:
+        name=provider['provider']; status=provider['status']
+        scope=''
+        if 'operations_attempted' in provider:
+            scope=('; operations completed/attempted: '+str(provider['operations_completed'])+'/'+
+                   str(provider['operations_attempted']))
+            if 'operations_planned' in provider:
+                scope+='; planned: '+str(provider['operations_planned'])
+        lines.append('- '+name+': '+coverage_status(status)+scope+'.')
+        for error in provider.get('errors',[]):
+            if not isinstance(error,dict):
+                continue
+            # Only internally classified fields; never response bodies or header values.
+            detail=error['code']
+            if error.get('http_status'):
+                detail+='; HTTP '+str(error['http_status'])
+            if error.get('rate_limit_kind'):
+                detail+='; rate-limit type '+error['rate_limit_kind']
+                detail+='; Retry-After '+error['retry_after_state']+'; reset '+error['reset_state']
+                if error.get('retry_after_at'):
+                    detail+='; Retry-After time '+error['retry_after_at']
+                if error.get('rate_limit_reset_at'):
+                    detail+='; reset time '+error['rate_limit_reset_at']
+            if error['code']=='RATE_LIMITED':
+                detail+='; earliest retry '+(error.get('earliest_retry_at') or 'UNKNOWN')
+            lines.append('  - '+detail+'.')
+        if status=='AUTH_REQUIRED':
+            lines.append('  - Access unavailable under the current credential-free policy; this is not an empty marketplace.')
+        elif status=='HTTP_406':
+            lines.append('  - HTTP 406 response observed; cause unverified. It does not establish permanent unavailability.')
+        elif status=='PARTIAL_SEARCH_SAMPLE':
+            lines.append('  - Bounded search sample; not an exhaustive search.')
+    if any(p['status']!='FETCHED' for p in report['providers']):
+        lines.extend(['', 'Incomplete coverage: zero qualified opportunities is inconclusive about available work.'])
     lines.extend(['', 'Review queue — PRELIMINARY, not qualified or recommended paid work.',
                   'Each listing establishes only what its publisher advertises. Reward, AI permission, costs,',
                   'deadline, ownership, eligibility and payment reliability need verification.', '',
@@ -167,6 +239,6 @@ def markdown_report(report):
     lines.extend(['', 'Ranking prioritizes an explicit reward signal, then documentation fit; no currency conversion',
                   'or estimated success probability. Full descriptions and rejection reasons are in the JSON report.',
                   'A partial search sample cannot establish that no other opportunities exist.', '',
-                  'Next action: review the original terms and AI policy of one preliminary lead before preparing work.',
+                  'Next action: '+next_action(report),
                   'No contact, claim, account creation, publication, installation or transaction is authorized by this report.', ''])
     return '\n'.join(lines)

@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlencode
 from network_safety import public_dns, PinnedHTTPSConnection
 from task_costs import assess_costs, net_return_gate
-from scout_common import FetchError, now
+from scout_common import FetchError, now, http_failure, error_record, coverage_status
 
 BASES = {'bounty': 'https://api.trybounty.ai/v1/agent/bounties',
          'basedagents': 'https://api.basedagents.ai/v1/tasks'}
@@ -34,26 +34,26 @@ class Transport:
 
     def get(self, url, token=None):
         p = validate_destination(url)
+        if token:
+            raise FetchError('CREDENTIALS_NOT_SUPPORTED_IN_PUBLIC_RUNNER')
         interval = 7 if p.hostname == 'api.github.com' else 1
         delay = interval - (time.monotonic() - self.last.get(p.hostname, 0))
         if delay > 0:
             time.sleep(delay)
-        conn = PinnedHTTPSConnection(p.hostname, public_dns(p.hostname)[0], 10)
+        try:
+            pinned_ip = public_dns(p.hostname)[0]
+        except ValueError:
+            raise FetchError('DNS_VALIDATION_FAILED') from None
+        conn = PinnedHTTPSConnection(p.hostname, pinned_ip, 10)
         headers = {'User-Agent':'OperationPennyPincherScout/1.0', 'Accept':'application/json',
                    'X-BasedAgents-Skill-Version':'1.3.9'}
         if p.hostname == 'api.github.com':
             headers['X-GitHub-Api-Version'] = '2022-11-28'
-        if token:
-            raise FetchError('CREDENTIALS_NOT_SUPPORTED_IN_PUBLIC_RUNNER')
         try:
             conn.request('GET', p.path + ('?' + p.query if p.query else ''), headers=headers)
             r = conn.getresponse()
             if r.status != 200:
-                if r.status == 402:
-                    raise FetchError('PAYMENT_REQUIRED_BLOCKED')
-                if r.status in (403,429) and (r.getheader('Retry-After') or r.getheader('X-RateLimit-Remaining') == '0'):
-                    raise FetchError('RATE_LIMITED', r.getheader('Retry-After') or r.getheader('X-RateLimit-Reset'))
-                raise FetchError({401:'AUTH_REQUIRED',403:'ACCESS_DENIED',429:'RATE_LIMITED'}.get(r.status,'HTTP_'+str(r.status)), r.getheader('Retry-After'))
+                raise http_failure(r.status, r.getheader, github=p.hostname == 'api.github.com')
             if r.getheader('Content-Type','').split(';')[0].strip() != 'application/json':
                 raise FetchError('INVALID_CONTENT_TYPE')
             body = r.read(MAX_BYTES+1)
@@ -137,7 +137,7 @@ def normalize(provider, row):
             'raw_sha256':hashlib.sha256(json.dumps(row,sort_keys=True).encode()).hexdigest()}
 
 def discover(provider, transport):
-    tasks=[]; seen=set(); cursor=None; offset=0; page_count=0; errors=[]
+    tasks=[]; seen=set(); cursor=None; offset=0; page_count=0; errors=[]; completed=0
     try:
         for page_count in range(1,6):
             query={'status':'open','limit':100}
@@ -149,6 +149,7 @@ def discover(provider, transport):
             if not isinstance(payload,dict) or not isinstance(payload.get(key),list):
                 raise ValueError('Invalid list envelope')
             rows=payload[key]
+            completed += 1
             for row in rows:
                 try:
                     task=normalize(provider,row)
@@ -165,14 +166,21 @@ def discover(provider, transport):
                 if len(rows)<100: break
                 offset+=100
         else:
-            return {'provider':provider,'status':'PARTIAL_PAGE_LIMIT','tasks':tasks,'errors':errors,'pages':page_count}
+            return {'provider':provider,'status':'PARTIAL_PAGE_LIMIT','tasks':tasks,'errors':errors,
+                    'pages':page_count,'coverage_status':'PARTIAL','coverage_interrupted':True,
+                    'operations_attempted':page_count,'operations_completed':completed,
+                    'coverage_note':'Stopped at the five-page bound; more pages may exist.'}
         status='PARTIAL_MALFORMED' if errors else 'FETCHED'
     except FetchError as e:
         status=e.code
-        errors.append({'code':e.code,'retry_after':e.retry_after})
-    except (ValueError,TypeError,AttributeError): status='MALFORMED_RESPONSE'
-    except (OSError,ssl.SSLError,http.client.HTTPException): status='NETWORK_ERROR'
-    return {'provider':provider,'status':status,'tasks':tasks,'errors':errors,'pages':page_count,'checked_at':now()}
+        errors.append(error_record(e, provider, 'list_open_tasks'))
+    except (ValueError,TypeError,AttributeError):
+        status='MALFORMED_RESPONSE'; errors.append({'code':status,'source':provider,'operation':'list_open_tasks'})
+    except (OSError,ssl.SSLError,http.client.HTTPException):
+        status='NETWORK_ERROR'; errors.append({'code':status,'source':provider,'operation':'list_open_tasks'})
+    return {'provider':provider,'status':status,'tasks':tasks,'errors':errors,'pages':page_count,'checked_at':now(),
+            'coverage_status':coverage_status(status),'coverage_interrupted':status!='FETCHED',
+            'operations_attempted':page_count,'operations_completed':completed}
 
 def run(transport=None):
     from public_work import discover_public_work, rank_leads
@@ -182,6 +190,9 @@ def run(transport=None):
     tasks=[t for p in providers for t in p['tasks']]
     viable=[t for t in tasks if t['eligible']]
     return {'generated_at':now(),'mode':'LIVE_READ_ONLY','providers':providers,
+            'execution_health':'REPORT_GENERATED','workflow_result':'NOT_OBSERVED_BY_SCOUT',
+            'discovery_coverage':'COMPLETE' if all(p['status']=='FETCHED' for p in providers) else 'PARTIAL',
+            'advertised_task_count':len(tasks),'qualified_opportunity_count':len(viable),
             'transport_security':getattr(type(transport),'security_mode','CUSTOM_TRANSPORT_NOT_VERIFIED'),
             'runtime_policy':{'paid_subscriptions_allowed':False,'paid_api_calls_allowed':False,
                 'automatic_spending_allowed':False,'paid_model_calls':False,
