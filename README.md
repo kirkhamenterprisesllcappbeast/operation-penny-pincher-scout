@@ -59,4 +59,27 @@ specific human authorization. The received-money scoreboard stays $0.00 because
 this runner has no receipt-verification integration. Advertised rewards are not
 income. Tests use explicitly synthetic fixtures; only live scans produce discoveries.
 
+## Reading operational health
+
+Successful execution means the program generated a report, not that every source
+was searched. The summary separately reports coverage, advertised tasks, reviewable
+leads, qualified opportunities, and verified receipts. A bounded GitHub sample is
+PARTIAL even if all three search requests completed. Completed/attempted operations
+show where a later failure interrupted collection; earlier results remain available.
+
+Rate-limit diagnostics retain only normalized HTTP status and allowlisted header
+metadata. GitHub's zero remaining quota supports a PRIMARY classification; otherwise
+the limit type stays UNDETERMINED. Error bodies are not read, so a secondary limit
+cannot be diagnosed from its response message. An ordinary 403 without rate-limit
+evidence remains ACCESS_DENIED. Missing or malformed cooldown headers stay unknown.
+When usable Retry-After or reset headers exist, the latest indicated time is a
+lower bound for another attempt, not a guarantee that access will work. There are
+no automatic retries, and GitHub requests remain spaced at least seven seconds apart.
+
+An empty queue never instructs the operator to review a nonexistent lead. Source
+failures remain non-fatal so the summary can explain blockers. The Scout cannot
+observe the final workflow result from inside its own report-generating step;
+read that separately from the Actions run status. HTTP 406 and authentication
+failures establish an observed access problem, not permanent marketplace emptiness.
+
 Copyright (c) 2026 Kirkham Enterprises LLC. All rights reserved.
